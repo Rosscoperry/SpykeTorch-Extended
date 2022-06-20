@@ -255,16 +255,4 @@ SpykeTorch/__pycache__
 # IntelliJ Idea project folder
 .idea/
 
-feature_vis/
-same_params_comparison/
-OptimizationOutput/
 plots/
-experiments/
-OptimizationOutput_LA/
-OptimizationOutput_SVM/
-adex_la_experiments/
-gestures_stats/
-nmnist_stats/
-optim_params_*/
-same_params_*/
-etherogeneous_params_*/
