@@ -1,3 +1,30 @@
+
+"""
+This modules contains implementations of Spiking Neuron Models:
+
+- LIF
+- EIF
+- QIF
+- AdEx
+- Izhikevich
+- Heterogeneous Neurons.
+
+The Neuron class is the base for all of the other classes and holds few common and useful methods.
+Each neuron object holds its own state and computes updates one time-step at a time. This is done by using the `__call__`
+method, which in turn makes the objects _callable_.
+Within this method, a layer of neuron get updated depending on the neuron type and the received input (Post-Synaptic Potentials (PSPs)).
+The output of a call to a neuron layer depends on a set of flags, but ultimately includes at least the propagated spikes, which are
+the winners selected through a Winner(s)-Take-All (WTA) mechanism.
+
+Within a neuron layer a lateral inhibition system puts neurons in refractory periods. Inhibition can be _feature-wise_ or
+_location-wise_. Feature-wise inhibition will inhibit all the neurons that share the same kernel as the winning one(s).
+Location-wise inhibition will inhibit all the neurons that correspond to the same input-location as the winning one(s).
+
+For most of the neurons (all except the _Simple_ ones), the input is expected to be scaled by \(\\frac{1}{t_s}\)
+(see https://neuronaldynamics.epfl.ch/online/Ch1.S3.html). Therefore, their output spikes are also scaled by this factor.
+
+"""
+
 import torch
 import numpy as np
 from . import functional as sf
@@ -8,6 +35,14 @@ DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 countC = 0
 countY = 0
+
+__pdoc__ = {"LIF.__call__": True,
+            "LIF_Simple.__call__": True,
+            "LIF_ode.__call__": True,
+            "EIF.__call__": True,
+            "QIF.__call__": True,
+            "AdEx.__call__": True,
+            "Izhikevich.__call__": True,}
 
 
 class Neuron(object):
@@ -60,13 +95,13 @@ class Neuron(object):
 
     def get_thresholded_potentials(self, current_state):
         """
-        General method to get thresholded membrane potentials, i.e. a Tensor where values are != 0.0 if they were above
+        General method to get thresholded membrane potentials, i.e. a Tensor where values are != 0.0 only if they were above
         the corresponding neuron's threshold.
         Args:
-            current_state: membrane potentials of the neurons
+            current_state (Tensor): membrane potentials of the neurons
 
         Returns:
-            thresholded membrane potentials.
+            Tensor: thresholded membrane potentials.
         """
         thresholded = current_state.clone().detach()
 
@@ -90,12 +125,12 @@ class Neuron(object):
         Plots the neuron's ODE. If current is given, ODE with and without current are plotted.
         Multiple plots can be stack onto each other by passing the proper figure and axes as an argument.
         Args:
-            figure: pyplot.Figure to use for plots. If None, a new one is created.
-            ax: pyplot.Axes to use for the plot. If None, a new one is created.
+            figure (pyplot.Figure): Figure to use for plots. If None, a new one is created.
+            ax (pyplot.Axes): Axes to use for the plot. If None, a new one is created.
             current: If provided, draws the current ON/OFF plots.
 
         Returns:
-            The figure and axes of the plot.
+            Tuple: The figure and axes of the plot.
         """
         f = False
         if figure is None:
@@ -136,17 +171,18 @@ class Neuron(object):
                               return_winners=True, n_winners=1):
         """
         Generalized method to save neurons internal state after updates have been calculated, and to calculate
-        the return value for the __call__ methods.
+        the return value for the \_\_call\_\_ methods.
         Used to keep the code cleaner.
         Args:
-            current_state:
-            return_thresholded_potentials: Boolean. Default False.
-            return_dudt: Boolean. Default False.
-            return_winners: Boolean.
-            n_winners: Int. Default 1.
+            current_state (Tensor): Tensor of up-to-date states of neurons.
+            return_thresholded_potentials (bool): Default: False.
+            return_dudt (bool): Default: False.
+            return_winners (bool): Default: True.
+            n_winners (int): Default 1.
 
         Returns:
-            Tuple. Return values depends on the selected flags.
+            Tuple: Return values depends on the selected flags.
+            (spikes, [thresholded_potentials, ] current_state, [dudt, ] [winners, ])
         """
         # inhibit where refractoriness is not consumed
         current_state[self.refractory_periods > 0] = self.resting_potential
@@ -224,20 +260,15 @@ class IF(Neuron):
                  return_winners=True, n_winners=1):
         r"""Computes the spike-wave tensor from tensor of potentials.
             Args:
-                potentials (Tensor): The tensor of input potentials.
-                return_thresholded_potentials (boolean): If True, the tensor of thresholded potentials will be returned
-                as well as the tensor of spike-wave. Default: False
+                potentials (Tensor): Input post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution weights) they came through.
+                return_thresholded_potentials (bool): If True, the tensor of thresholded potentials will be returned as well as the tensor of spike-wave. Default: False
+                return_dudt (bool): Default: False.
+                return_winners (bool): Default: True.
+                n_winners (bool): Default: 1.
             Returns:
-                Tuple. (spikes, [thresholded_potentials, ], current_state, [dudt, ], [winners, ]
+                Tuple: (spikes, [thresholded_potentials, ] current_state, [dudt, ] [winners, ])
             """
-        ret = (spikes,)
-        if return_thresholded_potentials:
-            ret += (thresholded,)
-        ret += (current_state,)
-        if return_dudt:
-            ret += (dudt,)
-        if return_winners:
-            ret += (winners,)
+
         # potentials = torch.sum(potentials, (2, 3), keepdim=True)
         if self.previous_state is None:
             self.previous_state = torch.full(potentials.size(), self.resting_potential, device=DEVICE)
@@ -249,10 +280,9 @@ class IF(Neuron):
         current_state = previous_state.float().clone().detach()
 
 
-
         # Input pulses.
-        # In the hypothesis that dt << tau_rc (at least one order of magnitude), we can use Taylor's expansion
-        # to approximate the exponential function. In this way we can more or less simply add the potentials in.
+        # In the hypothesis that dt << tau_rc, we can use Taylor's expansion to approximate the exponential function.
+        # In this way we can more or less simply add the potentials in.
         # input_spikes_impact = potentials * (1 - self.exp_term)
 
         input_spikes_impact = potentials*self.ts/self.C  # Taylor expansion form (See Neuronal Dynamics Ch.1 ¶ 1.3.2)
@@ -263,8 +293,12 @@ class IF(Neuron):
         thresholded = self.get_thresholded_potentials(current_state)
 
         spiked = thresholded != 0.0
+        # by using this neuron model, spikes are assumed to have amplitude $ A = A_0/t_s $ where A_0 is the spike value
+        # (normally 1), and t_s is the time-step size.
         spikes = torch.div(thresholded.sign(), self.ts)
         winners = sf.get_k_winners(thresholded, spikes=spikes, kwta=n_winners)
+        # name is non_inhibited_spikes because the corresponding neurons get into refractoriness as if they spiked,
+        # even if they haven't actually spiked.
         non_inihibited_spikes = torch.full(spiked.shape, False)
         for w in winners:
             # inhibit all the feature map
@@ -299,17 +333,19 @@ class LIF(Neuron):
                  per_neuron_thresh=None):
 
         """
-        Creates a Leaky Integrate and Fire neuron(s) that receives input potentials from a preceding convolution
-        and updates its state according to the amount of 'energy' received (i.e. if it's enough, it fires a spike).
+        Creates a Leaky Integrate and Fire neuron(s) that receives input potentials and updates its state according to
+        the amount of 'energy' received (i.e. if it's enough, it fires a spike).
         The neuron(s) state needs to be manually reset when a sequence of related inputs ends (unless the next input is
         to be considered as related to the current one as well).
 
         Args:
-            conv: SpykeTorch.snn.Convolution object the neuron(s) is attached to.
+            threshold: threshold above which the neuron(s) fires a spike
             tau_rc: the membrane time constant.
             ts: the time step used for computations, needs to be at least 10 times smaller than tau_rc.
             resting_potential: potential at which the neuron(s) is set to after a spike.
-            threshold: threshold above which the neuron(s) fires a spike
+            refractory_timesteps: number of timestep of hyperpolarization after a spike.
+            C: Capacitance of the membrane potential. Influences the input potential effect.
+            per_neuron_thresh: defines neuron-wise threshold. If None, a layer-wise threshold is used. Default: None.
         """
 
         # assert tau_rc / ts >= 10  # needs to hold for Taylor series approximation
@@ -337,14 +373,16 @@ class LIF(Neuron):
 
     def __call__(self, potentials, return_thresholded_potentials=False, return_dudt=False,
                  return_winners=True, n_winners=1, return_winning_spikes=False):
-        r"""Computes the spike-wave tensor from tensor of potentials. If :attr:`threshold` is :attr:`None`, all the neurons
-            emit one spike (if the potential is greater than zero) in the last time step.
+        r"""Computes a (time-) step update for layer of LIF neurons.
+
             Args:
-                potentials (Tensor): The tensor of input potentials.
-                return_thresholded_potentials (boolean): If True, the tensor of thresholded potentials will be returned
-                as well as the tensor of spike-wave. Default: False
+                potentials (Tensor): Input post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution weights) they came through.
+                return_thresholded_potentials (bool): If True, the tensor of thresholded potentials will be returned as well as the tensor of spike-wave. Default: False
+                return_dudt (bool): Default: False.
+                return_winners (bool): Default: True.
+                n_winners (bool): Default: 1.
             Returns:
-                Tensor: Spike-wave tensor.
+                Tuple: (spikes, [thresholded_potentials, ] current_state, [dudt, ] [winners, ])
             """
         # potentials = torch.sum(potentials, (2, 3), keepdim=True)
         if self.previous_state is None:
@@ -388,6 +426,8 @@ class LIF(Neuron):
         thresholded = self.get_thresholded_potentials(current_state)
 
         spiked = thresholded != 0.0
+        # by using this neuron model, spikes are assumed to have amplitude $ A = A_0/t_s $ where A_0 is the spike value
+        # (here 1), and t_s is the time-step size.
         spikes = torch.div(thresholded.sign(), self.ts)
 
         winners = sf.get_k_winners(thresholded, spikes=spikes, kwta=n_winners)
@@ -426,15 +466,29 @@ class LIF(Neuron):
         return ret
 
 class LIF_Simple(Neuron):
+
     def __init__(self, threshold, tau_rc=0.02, ts=0.001, resting_potential=0.0, refractory_timesteps=2,
-                 per_neuron_threshold=None, **kwargs):
+                 per_neuron_threshold=None):
+        """
+            A simplified version of the LIF neuron which does not take into account the capacitance and uses a simple decay.
+            With this class, spikes are propagated with amplitude \(A = 1\), instead of \(A = \\frac{1}{t_s}\)
+
+            Args:
+                threshold: threshold above which the neuron(s) fires a spike
+                tau_rc: the membrane time constant.
+                ts: the time step used for computations, needs to be at least 10 times smaller than tau_rc.
+                resting_potential: potential at which the neuron(s) is set to after a spike.
+                refractory_timesteps: number of timestep of hyperpolarization after a spike.
+                C: Capacitance of the membrane potential. Influences the input potential effect.
+                per_neuron_thresh: Defines neuron-wise threshold. If None, a layer-wise threshold is used. Default: None.
+        """
         Neuron.__init__(self, resting_potential=resting_potential, threshold=threshold)
         self.refractory_timesteps = refractory_timesteps
         self.refractoriness = refractory_timesteps*ts
         self.per_neuron_thresh = per_neuron_threshold
         self.tau_rc = tau_rc
         self.ts = ts
-        assert tau_rc > 3*ts  # needed for Taylor approx.; actually would be better with times more than ts
+        assert tau_rc > 3*ts  # needed for Taylor approx.; actually would be better with 6 times more than ts
         self.decay = 1 - ts/tau_rc  # Taylor approx
 
     def reset(self):
@@ -446,7 +500,18 @@ class LIF_Simple(Neuron):
 
     def __call__(self, potentials, return_thresholded_potentials=False, return_dudt=False,
                  return_winners=True, n_winners=1, return_winning_spikes=False):
+        """
+        Calculates a (time-) step update for the layer of LIF neurons.
 
+        Args:
+            potentials (Tensor): Input post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution weights) they came through.
+            return_thresholded_potentials (bool): If True, the tensor of thresholded potentials will be returned as well as the tensor of spike-wave. Default: False
+            return_dudt (bool): Default: False.
+            return_winners (bool): Default: True.
+            n_winners (bool): Default: 1.
+        Returns:
+            Tuple: (spikes, [thresholded_potentials, ] current_state, [dudt, ] [winners, ])
+        """
         if self.previous_state is None:
             self.previous_state = torch.full(potentials.size(), self.resting_potential, device=DEVICE)
             self.refractory_periods = torch.full(potentials.size(), 0.0, device=DEVICE)
@@ -468,7 +533,7 @@ class LIF_Simple(Neuron):
                 non_inihibited_spikes[0, w[0], :, :] = True  # This is then used to inhibit all neurons in the same feature-group of neurons as the one who winned
             elif self.inhibition_mode == "location":
                 non_inihibited_spikes[0, :, w[1], w[2]] = True
-            # non_inihibited_spikes[0] = True
+            # non_inihibited_spikes[0] = True  # to be used in single-neuron scenarios
         current_state[spiked] = self.resting_potential
         self.previous_state = current_state
 
@@ -500,17 +565,18 @@ class LIF_ode(Neuron):
                  per_neuron_thresh=None):
 
         """
-        Creates a Leaky Integrate and Fire neuron(s) that receives input potentials from a preceding convolution
-        and updates its state according to the amount of 'energy' received (i.e. if it's enough, it fires a spike).
-        The neuron(s) state needs to be manually reset when a sequence of related inputs ends (unless the next input is
-        to be considered as related to the current one as well).
+        Creates a Leaky Integrate and Fire neuron(s) that receives input potentials and updates its state according to the amount of 'energy' received (i.e. if it's enough, it fires a spike).
+        Differently from the LIF class, the LIF_ode uses the LIF ode to directly calculate updates time-step by time-step.
+
 
         Args:
-            conv: SpykeTorch.snn.Convolution object the neuron(s) is attached to.
-            tau_rc: the membrane time constant.
-            ts: the time step used for computations, needs to be at least 10 times smaller than tau_rc.
-            resting_potential: potential at which the neuron(s) is set to after a spike.
-            threshold: threshold above which the neuron(s) fires a spike
+                threshold: threshold above which the neuron(s) fires a spike
+                tau_rc: the membrane time constant.
+                ts: the time step used for computations, needs to be at least 10 times smaller than tau_rc.
+                resting_potential: potential at which the neuron(s) is set to after a spike.
+                refractory_timesteps: number of timestep of hyperpolarization after a spike.
+                C: Capacitance of the membrane potential. Influences the input potential effect.
+                per_neuron_thresh: Defines neuron-wise threshold. If None, a layer-wise threshold is used. Default: None.
         """
 
         # assert tau_rc / ts >= 10  # needs to hold for Taylor series approximation
@@ -535,14 +601,15 @@ class LIF_ode(Neuron):
 
     def __call__(self, potentials, return_thresholded_potentials=False, return_dudt=False,
                  return_winners=True, n_winners=1):
-        r"""Computes the spike-wave tensor from tensor of potentials. If :attr:`threshold` is :attr:`None`, all the neurons
-            emit one spike (if the potential is greater than zero) in the last time step.
+        """Computes a (time-) step update for the layer of LIF neurons.
             Args:
-                potentials (Tensor): The tensor of input potentials.
-                return_thresholded_potentials (boolean): If True, the tensor of thresholded potentials will be returned
-                as well as the tensor of spike-wave. Default: False
+                potentials (Tensor): Input post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution weights) they came through.
+                return_thresholded_potentials (bool): If True, the tensor of thresholded potentials will be returned as well as the tensor of spike-wave. Default: False
+                return_dudt (bool): Default: False.
+                return_winners (bool): Default: True.
+                n_winners (bool): Default: 1.
             Returns:
-                Tensor: Spike-wave tensor.
+                Tuple: (spikes, [thresholded_potentials, ] current_state, [dudt, ] [winners, ])
             """
         # potentials = torch.sum(potentials, (2, 3), keepdim=True)
         if self.previous_state is None:
@@ -599,15 +666,20 @@ class EIF(Neuron):
     def __init__(self, threshold, tau_rc=0.02, ts=0.001, delta_t=0.5, theta_rh=None, resting_potential=0.0,
                  refractory_timesteps=2, C=0.281, v_reset=None):
         """
-        Creates an exponential integrate and fire neuron.
+        Creates a layer of exponential integrate and fire neurons.
         Args:
-            conv: snn.Convolution object the neuron relates to.
+            threshold: Default: None.
             tau_rc: Membrane time constant a.k.a. tau_m or tau in seconds. Default: 0.02.
             ts: time-step value in seconds. Default: 0.001.
             delta_t: Sharpness parameter (upswing on the exponential curve). If ~0, EIF behaves like LIF. Default: 0.5.
-            theta_rh: Rheobase threshold. Default: 5.
+            theta_rh: Rheobase threshold. Default: None.
             resting_potential: Default: 0.0.
-            threshold: Default: None.
+            refractory_timesteps: Default: 2.
+            C: Capacitance. Default: 0.281.
+            v_reset: Default: None.
+
+
+        .. note:: `theta_rh` being `None` will cause `theta_rh` to be \(\\frac{3}{4}V_{thresh}\).
         """
         Neuron.__init__(self, resting_potential=resting_potential, threshold=threshold)
 
@@ -641,19 +713,19 @@ class EIF(Neuron):
     def __call__(self, potentials, return_thresholded_potentials=False, return_dudt=False,
                  return_winners=True, n_winners=1):
         """
-        Calculates the update amount for the neuron as specified by the following differential equation:
+        Calculates the (time-) step update for the neurons as specified by the following differential equation:
         $$
-            \tau\frac{du}{dt} = -(u - u_{rest}) + \Delta_T \cdot \exp\left({\frac{u - \Theta_{rh}}{\Delta_T}}\right)
-            + R\cdot I(t)
+            \\tau_{rc}\\frac{du}{dt} = -(u - u_{rest}) + \\Delta_T \\cdot \\exp\\left({\\frac{u - \\Theta_{rh}}{\\Delta_T}}\\right)
+            + R\\cdot I(t)
         $$
         Args:
-            potentials: Post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the
-            equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution
-            weights) they came through.
-            return_thresholded_potentials: Default: None.
-
+            potentials (Tensor): Input post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution weights) they came through.
+            return_thresholded_potentials (bool): If True, the tensor of thresholded potentials will be returned as well as the tensor of spike-wave. Default: False
+            return_dudt (bool): Default: False.
+            return_winners (bool): Default: True.
+            n_winners (bool): Default: 1.
         Returns:
-
+            Tuple: (spikes, [thresholded_potentials, ] current_state, [dudt, ] [winners, ])
         """
         # potentials = torch.sum(potentials, (2, 3), keepdim=True)
 
@@ -677,9 +749,6 @@ class EIF(Neuron):
         dudt = current_state - self.previous_state
         # current_state.clip(self.resting_potential, None)
 
-        # TODO: Maybe, given that a proper assumption according to Neuronal Dynamics book, would be to have
-        # TODO: threshold >> theta_rh + delta_t, if it is None I could set it to be 1 order of magnitude greater?
-        # TODO: i.e. threshold = (delta_T + theta_rh) * 10
         thresholded = self.get_thresholded_potentials(current_state)
 
         spiked = thresholded != 0.0
@@ -712,7 +781,22 @@ class EIF(Neuron):
 
 class EIF_Simple(Neuron):
     def __init__(self, threshold, tau_rc=0.02, ts=0.001, delta_t=0.5, theta_rh=None, resting_potential=0.0,
-                 refractory_timesteps=2, v_reset=None, per_neuron_threshold=None, **kwargs):
+                 refractory_timesteps=2, v_reset=None, per_neuron_threshold=None):
+        """
+        Creates a layer of exponential integrate and fire neurons. These neurons are simplified with respect to the EIF class, in the sense that the capacitance is not used anymore, the linear decay is implemented through a simple multiplication and the incoming potentials are not expected to be scaled by \(\\frac{1}{t_s}\).
+        Args:
+            threshold: Default: None.
+            tau_rc: Membrane time constant a.k.a. tau_m or tau in seconds. Default: 0.02.
+            ts: time-step value in seconds. Default: 0.001.
+            delta_t: Sharpness parameter (upswing on the exponential curve). If ~0, EIF behaves like LIF. Default: 0.5.
+            theta_rh: Rheobase threshold. Default: None.
+            resting_potential: Default: 0.0.
+            refractory_timesteps: Default: 2.
+            C: Capacitance. Default: 0.281.
+            v_reset: Default: None.
+
+        .. note:: `theta_rh` being `None` will cause `theta_rh` to be \(\\frac{3}{4}V_{thresh}\).
+        """
         Neuron.__init__(self, resting_potential=resting_potential, threshold=threshold)
         self.refractory_timesteps = refractory_timesteps
         self.refractoriness = self.refractory_timesteps * ts
@@ -745,7 +829,21 @@ class EIF_Simple(Neuron):
 
     def __call__(self, potentials, return_thresholded_potentials=False, return_dudt=False,
                  return_winners=True, n_winners=1, return_winning_spikes=False):
-
+        """
+        Calculates the (time-) step update for the neurons as specified by the following differential equation:
+        $$
+            \\tau_{rc}\\frac{du}{dt} = -(u - u_{rest}) + \\Delta_T \\cdot \\exp\\left({\\frac{u - \\Theta_{rh}}{\\Delta_T}}\\right)
+            + R\\cdot I(t)
+        $$
+        Args:
+            potentials (Tensor): Input post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution weights) they came through.
+            return_thresholded_potentials (bool): If True, the tensor of thresholded potentials will be returned as well as the tensor of spike-wave. Default: False
+            return_dudt (bool): Default: False.
+            return_winners (bool): Default: True.
+            n_winners (bool): Default: 1.
+        Returns:
+            Tuple: (spikes, [thresholded_potentials, ] current_state, [dudt, ] [winners, ])
+        """
         if self.previous_state is None:
             self.previous_state = torch.full(potentials.size(), self.resting_potential, device=DEVICE)
             self.refractory_periods = torch.full(potentials.size(), 0.0, device=DEVICE)
@@ -799,19 +897,24 @@ class EIF_Simple(Neuron):
 class AdEx(Neuron):
 
     def __init__(self, threshold, tau_rc=0.02, ts=0.001, delta_t=0.5,
-                 a=0.6, b=0.7, tau_w=1,
                  theta_rh=None, resting_potential=0.0,
-                 refractory_timesteps=2, C=0.281, v_reset=None):
+                 refractory_timesteps=2, C=0.281, v_reset=None,
+                 a=0.6, b=0.7, tau_w=1):
         """
-        Creates an exponential integrate and fire neuron.
+        Creates a layer of Adaptive Exponential Integrate and Fire (AdEx) neurons.
         Args:
-            conv: snn.Convolution object the neuron relates to.
-            tau_rc: Membrane time constant a.k.a. tau_m or tau in seconds. Default: 0.02.
+            threshold: Default: None.
+            tau_rc: Membrane time constant a.k.a. tau_m or tau, in seconds. Default: 0.02.
             ts: time-step value in seconds. Default: 0.001.
             delta_t: Sharpness parameter (upswing on the exponential curve). If ~0, EIF behaves like LIF. Default: 0.5.
-            theta_rh: Rheobase threshold. Default: 5.
+            theta_rh: Rheobase threshold, if None it's equal to \(\\frac{3}{4}V_{thresh}\). Default: None.
             resting_potential: Default: 0.0.
-            threshold: Default: None.
+            refractory_timesteps: Default: 2.
+            C: Capacitance. Default: 0.281.
+            v_reset: After-spike reset voltage, if None it is equal to the resting potential. Default: None.
+            a: Adaptation variable parameter to regulate the adaptation dependence from the membrane potential. Default: 0.6.
+            b: Adaptation variable parameter to regulate the adaptation increase upon emission of a spike. Default: 0.7.
+            tau_w: Adaptation variable time constant. Default: 1.
         """
         super(AdEx, self).__init__(resting_potential=resting_potential, threshold=threshold)
 
@@ -847,20 +950,20 @@ class AdEx(Neuron):
     def __call__(self, potentials, return_thresholded_potentials=False, return_dudt=False,
                  return_winners=True, n_winners=1):
         """
-        Calculates the update amount for the neuron as specified by the following differential equation:
-        TODO: update to match AdEx Eq.
+        Calculates a (time-) step update for the neuron(s) as specified by the following differential equations:
         $$
-            \tau\frac{du}{dt} = -(u - u_{rest}) + \Delta_T \cdot \exp\left({\frac{u - \Theta_{rh}}{\Delta_T}}\right)
-            + R\cdot I(t)
+            \\tau_{rc}\\frac{du}{dt} = -(u - u_{rest}) + \\Delta_T \\cdot \\exp\\left({\\frac{u - \\Theta_{rh}}{\\Delta_T}}\\right)
+            - R\\cdot \\omega + R\\cdot I(t) \\\\
+            \\tau_w\\frac{d\\omega}{dt} = a(u - u_{rest}) + b\\sum_{t^{(f)}}\\delta(t-t^{(f)})
         $$
         Args:
-            potentials: Post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the
-            equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution
-            weights) they came through.
-            return_thresholded_potentials: Default: None.
-
+            potentials (Tensor): Input post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution weights) they came through.
+            return_thresholded_potentials (bool): If True, the tensor of thresholded potentials will be returned as well as the tensor of spike-wave. Default: False
+            return_dudt (bool): Default: False.
+            return_winners (bool): Default: True.
+            n_winners (bool): Default: 1.
         Returns:
-
+            Tuple: (spikes, [thresholded_potentials, ] current_state, [dudt, ] [winners, ])
         """
         # potentials = torch.sum(potentials, (2, 3), keepdim=True)
 
@@ -931,15 +1034,20 @@ class QIF(Neuron):
     def __init__(self, threshold, tau_rc=0.02, ts=0.001, u_c=None, a=0.001, resting_potential=0.0,
                  refractory_timesteps=2, C=0.281, v_reset=None):
         """
-        Creates an exponential integrate and fire neuron.
+        Creates a layer of Quadratic Integrate-and-Fire (QIF) neurons.
         Args:
-            conv: snn.Convolution object the neuron relates to.
+            threshold: Default: None.
             tau_rc: Membrane time constant a.k.a. tau_m or tau in seconds. Default: 0.02.
             ts: time-step value in seconds. Default: 0.001.
+            Cut-off threshold (negative-positive membrane potential update transition point). Default: None.
             a: Sharpness parameter (upswing on the parabolic curve). Default: None.
-            u_c: 'Rheobase' (similar to theta_rh in EIF in behaviour) threshold. Default: 5.
             resting_potential: Default: 0.0.
-            threshold: Default: None.
+            refractory_timesteps: Default: 2.
+            C: Capacitance. Default: 0.281.
+            v_reset: Default: None.
+
+
+        .. note:: `u_c` being `None` will cause `u_c` to be \(\\frac{3}{4}V_{thresh}\).
         """
         Neuron.__init__(self, resting_potential=resting_potential, threshold=threshold)
 
@@ -973,18 +1081,18 @@ class QIF(Neuron):
     def __call__(self, potentials, return_thresholded_potentials=False, return_dudt=False,
                  return_winners=True, n_winners=1):
         """
-        Calculates the update amount for the neuron as specified by the following differential equation:
+        Calculates a (time-) step update for the neuron as specified by the following differential equation:
         $$
-            \tau\frac{du}{dt} = -a_0(u - u_{rest})(u - u_{c}) + R\cdot I(t)
+            \\tau_{rc}\\frac{du}{dt} = -a_0(u - u_{rest})(u - u_{c}) + R\\cdot I(t)
         $$
         Args:
-            potentials: Post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the
-            equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution
-            weights) they came through.
-            return_thresholded_potentials: Default: None.
-
+            potentials (Tensor): Input post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution weights) they came through.
+            return_thresholded_potentials (bool): If True, the tensor of thresholded potentials will be returned as well as the tensor of spike-wave. Default: False
+            return_dudt (bool): Default: False.
+            return_winners (bool): Default: True.
+            n_winners (bool): Default: 1.
         Returns:
-
+            Tuple: (spikes, [thresholded_potentials, ] current_state, [dudt, ] [winners, ])
         """
 
         if self.previous_state is None:
@@ -1046,9 +1154,9 @@ class Izhikevich(Neuron):
                  resting_potential=0.0,
                  refractory_timesteps=2, C=0.281, v_reset=None):
         """
-        Creates an exponential integrate and fire neuron.
+        Creates a layer of Izhikevich's neurons.
+
         Args:
-            conv: snn.Convolution object the neuron relates to.
             tau_rc: Membrane time constant a.k.a. tau_m or tau in seconds. Default: 0.02.
             ts: time-step value in seconds. Default: 0.001.
             delta_t: Sharpness parameter (upswing on the exponential curve). If ~0, EIF behaves like LIF. Default: 0.5.
@@ -1090,20 +1198,20 @@ class Izhikevich(Neuron):
     def __call__(self, potentials, return_thresholded_potentials=False, return_dudt=False,
                  return_winners=True, n_winners=1):
         """
-        Calculates the update amount for the neuron as specified by the following differential equation:
-        TODO: update to match AdEx Eq.
+        Calculates the update amount for the neuron as specified by the following differential equations:
+
         $$
-            \tau\frac{du}{dt} = -(u - u_{rest}) + \Delta_T \cdot \exp\left({\frac{u - \Theta_{rh}}{\Delta_T}}\right)
-            + R\cdot I(t)
+            \\frac{du}{dt} = 0.04u^2 + 5u + 140 - \\omega + I \\\\
+            \\frac{d\\omega}{dt} = a(b\\cdot u - \\omega)
         $$
         Args:
-            potentials: Post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the
-            equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution
-            weights) they came through.
-            return_thresholded_potentials: Default: None.
-
+            potentials (Tensor): Input post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution weights) they came through.
+            return_thresholded_potentials (bool): If True, the tensor of thresholded potentials will be returned as well as the tensor of spike-wave. Default: False
+            return_dudt (bool): Default: False.
+            return_winners (bool): Default: True.
+            n_winners (bool): Default: 1.
         Returns:
-
+            Tuple: (spikes, [thresholded_potentials, ] current_state, [dudt, ] [winners, ])
         """
         # potentials = torch.sum(potentials, (2, 3), keepdim=True)
 
@@ -1141,7 +1249,7 @@ class Izhikevich(Neuron):
         non_inihibited_spikes = torch.full(spiked.shape, False)
         for w in winners:
             #non_inihibited_spikes[0, w[0], :, :] = True
-            non_inihibited_spikes[0] = True
+            non_inihibited_spikes[0] = True  # TODO
         current_state[spiked] = self.v_reset
 
         # update refractory periods
@@ -1161,22 +1269,46 @@ class Izhikevich(Neuron):
         return ret
 
 
-class HetherogeneousNeuron(Neuron):
+class HeterogeneousNeuron(Neuron):
 
     def __init__(self, conv):
+        """
+        Base class for layers of neurons having a non-homogeneous set of parameters.
+        """
         super().__init__(conv)
 
     def get_uniform_distribution(self, range, size):
+        """
+        Creates a uniformly distributed set of values in the `range` and `size` provided.
+        Args:
+            range (list): Range to sample the values from.
+            size (tuple): Size of the Tensor to sample.
+
+        Returns:
+            Tensor: Tensor containing the uniformly distributed values.
+        """
         ones = np.ones(size)
         uniform = np.random.uniform(*range, size=(size[0], size[1], 1, 1))
         uniform = torch.from_numpy(uniform*ones)
         return uniform.to(DEVICE)
 
 
-class UniformLIF(LIF, HetherogeneousNeuron):
+class UniformLIF(LIF, HeterogeneousNeuron):
 
     def __init__(self, threshold, tau_range, ts=0.001, resting_potential=0.0, refractory_timesteps=2, C=0.281,
                  per_neuron_thresh=None):
+        """
+        Creates a layer of heterogeneous Leaky Integrate and Fire neuron(s).
+
+        Args:
+            threshold: threshold above which the neuron(s) fires a spike.
+            tau_range (list): Range of values from which to sample the \(\\tau_{rc}\).
+            ts: the time step used for computations, needs to be at least 10 times smaller than tau_rc.
+            resting_potential: potential at which the neuron(s) is set to after a spike.
+            refractory_timesteps: number of timestep of hyperpolarization after a spike.
+            C: Capacitance of the membrane potential. Influences the input potential effect.
+            per_neuron_thresh: defines neuron-wise threshold. If None, a layer-wise threshold is used. Default: None.
+        """
         LIF.__init__(self, threshold, C=C, refractory_timesteps=refractory_timesteps, ts=ts,
                      resting_potential=resting_potential, per_neuron_thresh=per_neuron_thresh)
         self.threshold = threshold
@@ -1193,14 +1325,31 @@ class UniformLIF(LIF, HetherogeneousNeuron):
         return super(UniformLIF, self).__call__(potentials, *args, **kwargs)
 
 
-class UniformEIF(EIF, HetherogeneousNeuron):
+class UniformEIF(EIF, HeterogeneousNeuron):
 
     def __init__(self, threshold, tau_range, ts=0.001, delta_t=0.5, theta_rh=None, resting_potential=0.0,
                  refractory_timesteps=2, C=0.281, v_reset=None):
+        """
+        Creates a layer of heterogeneous Exponential Integrate and Fire (EIF) neurons.
+
+        Args:
+            threshold: Default: None.
+            tau_range (list): Range of values from which to sample the \(\\tau_{rc}\).
+            ts: time-step value in seconds. Default: 0.001.
+            delta_t: Sharpness parameter (upswing on the exponential curve). If ~0, EIF behaves like LIF. Default: 0.5.
+            theta_rh: Rheobase threshold. Default: None.
+            resting_potential: Default: 0.0.
+            refractory_timesteps: Default: 2.
+            C: Capacitance. Default: 0.281.
+            v_reset: Default: None.
+
+        .. note:: `theta_rh` being `None` will cause `theta_rh` to be \(\\frac{3}{4}V_{thresh}\).
+        """
         EIF.__init__(self, threshold=threshold, tau_rc=0.02, ts=ts, delta_t=delta_t, theta_rh=theta_rh,
                      resting_potential=resting_potential, refractory_timesteps=refractory_timesteps, C=C,
                      v_reset=v_reset)
-        HetherogeneousNeuron.__init__(self, conv)
+
+        HeterogeneousNeuron.__init__(self)
         self.tau_range = tau_range
         self.taus = None
 
@@ -1212,13 +1361,28 @@ class UniformEIF(EIF, HetherogeneousNeuron):
         return super(UniformEIF, self).__call__(potentials, *args, **kwargs)
 
 
-class UniformQIF(QIF, HetherogeneousNeuron):
+class UniformQIF(QIF, HeterogeneousNeuron):
 
     def __init__(self, threshold, tau_range, ts=0.001, u_c=None, a=0.001, resting_potential=0.0,
                  refractory_timesteps=2, C=0.281, v_reset=None):
+        """
+        Creates a layer of heterogeneous Quadratic Integrate-and-Fire (QIF) neurons.
+        Args:
+            threshold: Default: None.
+            tau_range (list): Range of values from which to sample the \(\\tau_{rc}\).
+            ts: time-step value in seconds. Default: 0.001.
+            u_c: Cut-off threshold (negative-positive membrane potential update transition point). Default: 5.
+            a: Sharpness parameter (upswing on the parabolic curve). Default: None.
+            resting_potential: Default: 0.0.
+            refractory_timesteps: Default: 2.
+            C: Capacitance. Default: 0.281.
+            v_reset: Default: None.
+
+        .. note:: `u_c` being `None` will cause `u_c` to be \(\\frac{3}{4}V_{thresh}\).
+        """
         QIF.__init__(self, threshold, tau_rc=0.02, ts=ts, u_c=u_c, a=a, resting_potential=resting_potential,
                  refractory_timesteps=refractory_timesteps, C=C, v_reset=v_reset)
-        HetherogeneousNeuron.__init__(self, conv)
+        HeterogeneousNeuron.__init__(self)
         self.tau_range = tau_range
         self.taus = None
 
