@@ -7,3 +7,5 @@ To setup this package, you can refer to the original repository, as no further i
 Concerning the implemented spiking neuron models, please refer to the [docs pages](https://daevem.github.io/SpykeTorch-Extended/neurons.html).
 
 For any information or correspondence please contact [davide.manna@stath.ac.uk](mailto:davide.manna@strath.ac.uk)
+
+Python version 3.9.21
