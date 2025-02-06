@@ -45,10 +45,15 @@ __pdoc__ = {"LIF.__call__": True,
             "Izhikevich.__call__": True,}
 
 
+class NoMoreWinnersError(RuntimeError):
+    def __init__(self):
+        super().__init__(self)
+
+
 class Neuron(object):
 
     def __init__(self, ts=0.01, resting_potential=0.0, v_reset=None, threshold=None, refractory_timesteps=0,
-                 inhibition_mode="feature"):
+                 inhibition_mode="feature", inhibition_radius=1):
         self._threshold = threshold
 
         self.resting_potential = resting_potential
@@ -60,6 +65,8 @@ class Neuron(object):
         self.refractory_periods = None
         self.v_reset = v_reset if v_reset is not None else resting_potential
         self.inhibition_mode = inhibition_mode
+        self.can_it_win = None
+        self.i_r = inhibition_radius
 
     @property
     def threshold(self):
@@ -220,7 +227,7 @@ class Neuron(object):
 
 class IF(Neuron):
 
-    def __init__(self, threshold, tau_rc=0.02, ts=0.001, resting_potential=0.0, refractory_timesteps=2, C=0.281):
+    def __init__(self, threshold, tau_rc=0.02, ts=0.001, resting_potential=0.0, refractory_timesteps=2, C=0.281, **kwargs):
 
         """
         Creates an Integrate and Fire neuron(s) that receives input potentials (from a preceding convolution)
@@ -239,7 +246,7 @@ class IF(Neuron):
 
         # assert tau_rc / ts >= 10  # needs to hold for Taylor series approximation
 
-        super(IF, self).__init__(resting_potential=resting_potential, threshold=threshold)
+        super(IF, self).__init__(resting_potential=resting_potential, threshold=threshold, **kwargs)
         self.ts = ts
         self.tau_rc = tau_rc
         self.ts_over_tau = ts / tau_rc  # for better performance (compute once and for all)
@@ -252,12 +259,13 @@ class IF(Neuron):
     def reset(self):
         self.previous_state = None
         self.refractory_periods = None
+        self.per_neuron_thresh = None
 
     def __str__(self):
         return "IF_Neuron_rt"+str(self.refractory_timesteps)+"_C"+str(self.C)
 
     def __call__(self, potentials, return_thresholded_potentials=False, return_dudt=False,
-                 return_winners=True, n_winners=1):
+                 return_winners=True, n_winners=1, disable_inhibition=False, training=True):
         r"""Computes the spike-wave tensor from tensor of potentials.
             Args:
                 potentials (Tensor): Input post-synaptic potentials. These are intended to be inside a torch.Tensor object and are the equivalent of the sum of the incoming spikes, each scaled by the strength of the synapse (convolution weights) they came through.
@@ -273,13 +281,15 @@ class IF(Neuron):
         if self.previous_state is None:
             self.previous_state = torch.full(potentials.size(), self.resting_potential, device=DEVICE)
             self.refractory_periods = torch.full(potentials.size(), 0.0, device=DEVICE)
+            self.can_it_win = torch.full(potentials.size(), 1.0, device=DEVICE)
             self.time_since_spike = torch.full(potentials.size(), 0.0, device=DEVICE)
 
         previous_state = self.previous_state.clone().detach()
 
         current_state = previous_state.float().clone().detach()
 
-
+        if (self.can_it_win == 0).all() and training:
+            raise NoMoreWinnersError()
         # Input pulses.
         # In the hypothesis that dt << tau_rc, we can use Taylor's expansion to approximate the exponential function.
         # In this way we can more or less simply add the potentials in.
@@ -290,20 +300,48 @@ class IF(Neuron):
 
         current_state.clip(self.resting_potential, None)
 
-        thresholded = self.get_thresholded_potentials(current_state)
-
+         # thresholded = self.get_thresholded_potentials(current_state)
+        thresholded = current_state.clone()
+        thresholded[thresholded < self.threshold] = 0
+        thresholded = sf.pointwise_inhibition(thresholded)
+        thresholded[self.refractory_periods > 0] = self.resting_potential
         spiked = thresholded != 0.0
         # by using this neuron model, spikes are assumed to have amplitude $ A = A_0/t_s $ where A_0 is the spike value
         # (normally 1), and t_s is the time-step size.
         spikes = torch.div(thresholded.sign(), self.ts)
-        winners = sf.get_k_winners(thresholded, spikes=spikes, kwta=n_winners)
+        winners = sf.get_k_winners(thresholded*self.can_it_win, spikes=spikes*self.can_it_win, kwta=n_winners, inhibition_radius=self.i_r)
         # name is non_inhibited_spikes because the corresponding neurons get into refractoriness as if they spiked,
         # even if they haven't actually spiked.
         non_inihibited_spikes = torch.full(spiked.shape, False)
         for w in winners:
             # inhibit all the feature map
-            non_inihibited_spikes[0, w[0], :, :] = True
-
+            if not disable_inhibition:
+                self.can_it_win[0, w[0], :, :] = 0
+                self.can_it_win[0, :, -self.i_r+w[1]:self.i_r+w[1]+1, -self.i_r+w[2]:self.i_r+w[2]+1] = 0
+            # if not disable_inhibition:
+            #     # non_inihibited_spikes[0, w[0], :, :] = True
+            #     non_inihibited_spikes[0, :, -self.i_r+w[1]:self.i_r+w[1]+1, -self.i_r+w[2]:self.i_r+w[2]+1] = True
+            # else:
+            #     non_inihibited_spikes[0, w[0], -self.i_r+w[1]:self.i_r+w[1]+1, -self.i_r+w[2]:self.i_r+w[2]+1] = True
+        # idxs = spiked.nonzero(as_tuple=True)
+        # for x, y in zip(idxs[2], idxs[3]):
+        #     non_inihibited_spikes[0, :, x, y] = True
+        # inhibit all neurons in spiked locations
+        if not disable_inhibition:
+            mask = torch.any(spiked, dim=1, keepdim=True)
+            # coord = mask.squeeze().nonzero(as_tuple=True)
+            # for x, y in zip(*coord):
+            #     mask[..., x-self.i_r:x+self.i_r+1, y-self.i_r:y+self.i_r+1] = True
+            # The commented above is the equivalent (but slower) of the code below using conv
+            idxs = torch.zeros_like(mask).float()
+            idxs[mask] = 1.
+            ks = int(self.i_r * 2 + 1)
+            w = torch.ones((1, 1, ks, ks)).cuda()
+            # put 1s around the locations of the spike in a radius i_r
+            idxs = torch.conv2d(idxs, w, padding="same")
+            mask = idxs > 0
+            mask = mask.repeat(1, spiked.shape[1], 1, 1)
+            non_inihibited_spikes[mask] = True
         current_state[spiked] = self.resting_potential
         current_state[self.refractory_periods > 0] = self.resting_potential
         dudt = current_state - self.previous_state
@@ -468,7 +506,7 @@ class LIF(Neuron):
 class LIF_Simple(Neuron):
 
     def __init__(self, threshold, tau_rc=0.02, ts=0.001, resting_potential=0.0, refractory_timesteps=2,
-                 per_neuron_threshold=None):
+                 per_neuron_threshold=None, **kwargs):
         """
             A simplified version of the LIF neuron which does not take into account the capacitance and uses a simple decay.
             With this class, spikes are propagated with amplitude \(A = 1\), instead of \(A = \\frac{1}{t_s}\)
@@ -482,24 +520,26 @@ class LIF_Simple(Neuron):
                 C: Capacitance of the membrane potential. Influences the input potential effect.
                 per_neuron_thresh: Defines neuron-wise threshold. If None, a layer-wise threshold is used. Default: None.
         """
-        Neuron.__init__(self, resting_potential=resting_potential, threshold=threshold)
+        Neuron.__init__(self, resting_potential=resting_potential, threshold=threshold, **kwargs)
         self.refractory_timesteps = refractory_timesteps
         self.refractoriness = refractory_timesteps*ts
         self.per_neuron_thresh = per_neuron_threshold
         self.tau_rc = tau_rc
         self.ts = ts
-        assert tau_rc > 3*ts  # needed for Taylor approx.; actually would be better with 6 times more than ts
+        # assert tau_rc > 3*ts  # needed for Taylor approx.; actually would be better with 6 times more than ts
         self.decay = 1 - ts/tau_rc  # Taylor approx
 
     def reset(self):
         self.previous_state = None
         self.refractory_periods = None
+        self.per_neuron_thresh = None
 
     def __str__(self):
         return "LIF_Simple_RT" + str(self.refractory_timesteps) + "_tau" + str(self.tau_rc)
 
     def __call__(self, potentials, return_thresholded_potentials=False, return_dudt=False,
-                 return_winners=True, n_winners=1, return_winning_spikes=False):
+                 return_winners=True, n_winners=1, return_winning_spikes=False, disable_inhibition=False, training=True,
+                 inhibition_mode="fl"):
         """
         Calculates a (time-) step update for the layer of LIF neurons.
 
@@ -509,12 +549,14 @@ class LIF_Simple(Neuron):
             return_dudt (bool): Default: False.
             return_winners (bool): Default: True.
             n_winners (bool): Default: 1.
+            inhibition_mode: "fl" for feature AND location, "f" for feature, "l" for location
         Returns:
             Tuple: (spikes, [thresholded_potentials, ] current_state, [dudt, ] [winners, ])
         """
         if self.previous_state is None:
             self.previous_state = torch.full(potentials.size(), self.resting_potential, device=DEVICE)
             self.refractory_periods = torch.full(potentials.size(), 0.0, device=DEVICE)
+            self.can_it_win = torch.full(potentials.size(), 1.0, device=DEVICE)
         previous_state = self.previous_state.clone().detach()
 
         current_state = previous_state*self.decay
@@ -526,14 +568,35 @@ class LIF_Simple(Neuron):
         spiked = thresholded != 0.0
         spikes = thresholded.sign()
 
-        winners = sf.get_k_winners(thresholded, spikes=spikes, kwta=n_winners)
+        # winners = sf.get_k_winners(thresholded, spikes=spikes, kwta=n_winners)
+        winners = sf.get_k_winners(thresholded*self.can_it_win, spikes=spikes*self.can_it_win, kwta=n_winners, inhibition_radius=self.i_r)
         non_inihibited_spikes = torch.full(spiked.shape, False)
         for w in winners:
-            if self.inhibition_mode == "feature":  # inhibit all the feature map
-                non_inihibited_spikes[0, w[0], :, :] = True  # This is then used to inhibit all neurons in the same feature-group of neurons as the one who winned
-            elif self.inhibition_mode == "location":
-                non_inihibited_spikes[0, :, w[1], w[2]] = True
+            if not disable_inhibition:
+                if "f" in inhibition_mode:
+                    self.can_it_win[0, w[0], :, :] = 0
+                if "l" in inhibition_mode:
+                    self.can_it_win[0, :, -self.i_r+w[1]:self.i_r+w[1]+1, -self.i_r+w[2]:self.i_r+w[2]+1] = 0
+        #     if self.inhibition_mode == "feature":  # inhibit all the feature map
+        #         non_inihibited_spikes[0, w[0], :, :] = True  # This is then used to inhibit all neurons in the same feature-group of neurons as the one who winned
+        #     elif self.inhibition_mode == "location":
+        #         non_inihibited_spikes[0, :, w[1], w[2]] = True
             # non_inihibited_spikes[0] = True  # to be used in single-neuron scenarios
+        if not disable_inhibition:
+            mask = torch.any(spiked, dim=1, keepdim=True)
+            # coord = mask.squeeze().nonzero(as_tuple=True)
+            # for x, y in zip(*coord):
+            #     mask[..., x-self.i_r:x+self.i_r+1, y-self.i_r:y+self.i_r+1] = True
+            # The commented above is the equivalent (but slower) of the code below using conv
+            idxs = torch.zeros_like(mask).float()
+            idxs[mask] = 1.
+            ks = int(self.i_r * 2 + 1)
+            w = torch.ones((1, 1, ks, ks)).cuda()
+            # put 1s around the locations of the spike in a radius i_r
+            idxs = torch.conv2d(idxs, w, padding="same")
+            mask = idxs > 0
+            mask = mask.repeat(1, spiked.shape[1], 1, 1)
+            non_inihibited_spikes[mask] = True
         current_state[spiked] = self.resting_potential
         self.previous_state = current_state
 

@@ -20,7 +20,7 @@ def pad(input, pad, value=0):
     return fn.pad(input, pad, value=value)
 
 # pooling
-def pooling(input, kernel_size, stride=None, padding=0):
+def pooling(input, kernel_size, stride=None, padding=0, return_indices=False):
     r"""Performs a 2D max-pooling over an input signal (spike-wave or potentials) composed of several input
     planes.
 
@@ -33,7 +33,7 @@ def pooling(input, kernel_size, stride=None, padding=0):
     Returns:
         Tensor: The result of the max-pooling operation.
     """
-    return fn.max_pool2d(input, kernel_size, stride, padding)
+    return fn.max_pool2d(input, kernel_size, stride, padding, return_indices=return_indices)
 
 def fire(potentials, threshold=None, return_thresholded_potentials=False):
     r"""Computes the spike-wave tensor from tensor of potentials. If :attr:`threshold` is :attr:`None`, all the neurons
@@ -146,13 +146,13 @@ def feature_inhibition(potentials, inhibited_features):
 
 # returns list of winners
 # inhibition_radius is to increase the chance of diversity among features (if needed)
-def get_k_winners(potentials, kwta = 1, inhibition_radius = 0, spikes = None):
+def get_k_winners(potentials, kwta = 1, inhibition_radius = 0, spikes = None, return_inhibited_pots=False):
     r"""Finds at most :attr:`kwta` winners first based on the earliest spike time, then based on the maximum potential.
     It returns a list of winners, each in a tuple of form (feature, row, column).
 
     .. note::
 
-        Winners are selected sequentially. Each winner inhibits surrounding neruons in a specific radius in all of the
+        Winners are selected sequentially. Each winner inhibits surrounding neurons in a specific radius in all of the
         other feature maps. Note that only one winner can be selected from each feature map.
 
     Args:
@@ -197,6 +197,8 @@ def get_k_winners(potentials, kwta = 1, inhibition_radius = 0, spikes = None):
                 total[:,rowMin:rowMax,colMin:colMax] = 0
         else:
             break
+    if return_inhibited_pots:
+        return winners, total
     return winners
 
 # decrease lateral intencities by factors given in the inhibition_kernel
