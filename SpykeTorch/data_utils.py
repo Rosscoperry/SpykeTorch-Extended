@@ -11,12 +11,12 @@ from random import shuffle, seed
 import torch
 from matplotlib import pyplot as plt
 from os import path
-from aermanager.parsers import parse_header_from_file, parse_dvs_ibm
+# from aermanager.parsers import parse_header_from_file, parse_dvs_ibm
 from queue import Queue
 from threading import Thread, Semaphore, BoundedSemaphore
 import multiprocessing as mp
 import threading as th
-from aermanager.dataset_generator import dataset_content_generator
+# from aermanager.dataset_generator import dataset_content_generator
 
 # sys.path.append(r"C:\Users\ixb20175\Desktop\Projects")
 
