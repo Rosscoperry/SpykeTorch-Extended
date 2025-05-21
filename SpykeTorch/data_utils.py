@@ -87,7 +87,7 @@ class PropheseeDataFeed(DataFeed):
                 return
             cls = fpath.split(os.sep)[-2]
             self.wizard.set_file(fpath)
-            yield self.wizard.read_time_window(), cls
+            yield self.wizard.read_time_window(), cls, fpath
 
 
 def events_to_frame(frame_size=(1280, 720), area_of_interest=None):
